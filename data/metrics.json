@@ -1,0 +1,16 @@
+{
+  "dataset": {"train_shape": [243787, 21], "test_shape": [104480, 21], "source": "Coursera data science challenge: video streaming platform churn"},
+  "train": {"roc_auc": 0.7868, "accuracy": 0.6988},
+  "test": {"roc_auc": 0.7486, "accuracy": 0.6822},
+  "classification_report": {
+    "Retained (0)": {"precision": 0.91, "recall": 0.68, "f1": 0.78, "support": 85409},
+    "Churned (1)":  {"precision": 0.32, "recall": 0.68, "f1": 0.44, "support": 19071},
+    "Macro avg":    {"precision": 0.62, "recall": 0.68, "f1": 0.61, "support": 104480},
+    "Weighted avg": {"precision": 0.80, "recall": 0.68, "f1": 0.72, "support": 104480}
+  },
+  "model": {
+    "algorithm": "XGBClassifier inside a scikit-learn Pipeline (ColumnTransformer: passthrough numerics + one-hot categoricals)",
+    "params": {"n_estimators": 1500, "learning_rate": 0.01, "max_depth": 6, "min_child_weight": 3, "subsample": 0.8, "colsample_bytree": 0.6, "gamma": 1.0, "reg_alpha": 0, "reg_lambda": 5.0, "scale_pos_weight": "n_retained / n_churned"},
+    "tuning": "RandomizedSearchCV, 5-fold, scoring = roc_auc"
+  }
+}
