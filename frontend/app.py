@@ -1,17 +1,42 @@
 """Streamlit dashboard for the customer churn model. Talks to the FastAPI service."""
+import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 
 API_URL = os.getenv("CHURN_API_URL", "http://localhost:8000").rstrip("/")
 ASSETS = Path(__file__).parent / "assets"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+TEST_FEATURES_PATH = DATA_DIR / "test.csv"
+TEST_LABELS_PATH = DATA_DIR / "test_sol.csv"
+MODEL_CARD_PATH = Path(__file__).resolve().parents[1] / "model_card.json"
 
 RISK_COLORS = {"Low": "#2e9e6b", "Medium": "#e3a008", "High": "#d64545"}
+BUSINESS_ASSUMPTIONS = {"horizon_months": 12, "save_rate": 0.15, "offer_cost": 15.0}
+if MODEL_CARD_PATH.exists():
+    try:
+        BUSINESS_ASSUMPTIONS.update(json.loads(MODEL_CARD_PATH.read_text()).get("business_assumptions", {}))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
 
 st.set_page_config(page_title="Customer Churn Predictor", page_icon="📉", layout="wide")
 
@@ -67,6 +92,190 @@ def get_importance(importance_type, top_n):
     return api_get("/feature-importance", importance_type=importance_type, top_n=top_n)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_current_test_predictions(api_url, test_path, labels_path, test_mtime, labels_mtime):
+    test = pd.read_csv(test_path)
+    labels = pd.read_csv(labels_path)
+    if not {"CustomerID", "Churn"}.issubset(labels.columns):
+        raise ValueError("test_sol.csv must contain CustomerID and Churn columns.")
+
+    labels = labels[["CustomerID", "Churn"]].drop_duplicates("CustomerID", keep="first")
+    labelled = test.merge(labels, on="CustomerID", how="inner").dropna(subset=["Churn"])
+    if labelled.empty:
+        raise ValueError("No labelled test customers were found.")
+
+    probabilities = []
+    for start in range(0, len(labelled), 25_000):
+        chunk = labelled.iloc[start:start + 25_000]
+        response = requests.post(
+            f"{api_url}/predict/batch",
+            params={"threshold": 0.5},
+            files={"file": ("test.csv", chunk.drop(columns="Churn").to_csv(index=False), "text/csv")},
+            timeout=300,
+        )
+        response.raise_for_status()
+        probabilities.extend(response.json()["churn_probability"])
+
+    return {
+        "customer_id": labelled["CustomerID"].astype(str).tolist(),
+        "actual": labelled["Churn"].astype(int).tolist(),
+        "probability": probabilities,
+        "monthly_charges": pd.to_numeric(labelled["MonthlyCharges"], errors="raise").tolist(),
+    }
+
+
+def net_campaign_value(y_true, probabilities, monthly_charges, threshold):
+    contacted = probabilities >= threshold
+    saved = contacted & (y_true == 1)
+    customer_value = monthly_charges * BUSINESS_ASSUMPTIONS["horizon_months"]
+    return (
+        BUSINESS_ASSUMPTIONS["save_rate"] * customer_value[saved].sum()
+        - BUSINESS_ASSUMPTIONS["offer_cost"] * contacted.sum()
+    )
+
+
+def render_current_test_results(data, threshold):
+    y_true = np.asarray(data["actual"], dtype=int)
+    probabilities = np.asarray(data["probability"], dtype=float)
+    monthly_charges = np.asarray(data["monthly_charges"], dtype=float)
+    predicted = (probabilities >= threshold).astype(int)
+    prevalence = float(y_true.mean())
+    net_value = net_campaign_value(y_true, probabilities, monthly_charges, threshold)
+
+    st.subheader("Current model on the held-out test set")
+    metrics = st.columns(7)
+    metrics[0].metric("Customers", f"{len(y_true):,}")
+    metrics[1].metric("ROC-AUC", f"{roc_auc_score(y_true, probabilities):.4f}")
+    metrics[2].metric("PR-AUC", f"{average_precision_score(y_true, probabilities):.4f}")
+    metrics[3].metric("Accuracy", f"{accuracy_score(y_true, predicted):.3f}")
+    metrics[4].metric("Churn precision", f"{precision_score(y_true, predicted, zero_division=0):.3f}")
+    metrics[5].metric("Churn recall", f"{recall_score(y_true, predicted, zero_division=0):.3f}")
+    metrics[6].metric("Net campaign value", f"${net_value:,.0f}")
+    st.caption(
+        f"Threshold {threshold:.2f} · assumptions: ${BUSINESS_ASSUMPTIONS['offer_cost']:,.0f} offer, "
+        f"{BUSINESS_ASSUMPTIONS['save_rate']:.0%} save rate, "
+        f"{BUSINESS_ASSUMPTIONS['horizon_months']} month value horizon."
+    )
+
+    left, right = st.columns(2)
+    fpr, tpr, _ = roc_curve(y_true, probabilities)
+    precision, recall, _ = precision_recall_curve(y_true, probabilities)
+    with left:
+        fig = go.Figure()
+        fig.add_scatter(x=fpr, y=tpr, mode="lines", name="Current model",
+                        line=dict(color="#246b62", width=3))
+        fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random",
+                        line=dict(color="#777777", dash="dash"))
+        fig.update_layout(title=f"ROC curve · AUC {roc_auc_score(y_true, probabilities):.3f}",
+                          xaxis_title="False positive rate", yaxis_title="True positive rate", height=380)
+        show_plot(fig, "current_test_roc")
+    with right:
+        fig = go.Figure()
+        fig.add_scatter(x=recall, y=precision, mode="lines", name="Current model",
+                        line=dict(color="#bd5a37", width=3))
+        fig.add_hline(y=prevalence, line_dash="dot", line_color="#777777",
+                      annotation_text=f"Churn prevalence {prevalence:.1%}")
+        fig.update_layout(title=f"Precision-recall · AP {average_precision_score(y_true, probabilities):.3f}",
+                          xaxis_title="Recall", yaxis_title="Precision", height=380)
+        show_plot(fig, "current_test_pr")
+
+    matrix = confusion_matrix(y_true, predicted, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    offer_cost = BUSINESS_ASSUMPTIONS["offer_cost"]
+    save_rate = BUSINESS_ASSUMPTIONS["save_rate"]
+    customer_value = monthly_charges * BUSINESS_ASSUMPTIONS["horizon_months"]
+    dollars = [
+        [0, -offer_cost * fp],
+        [-customer_value[(y_true == 1) & (predicted == 0)].sum(),
+         save_rate * customer_value[(y_true == 1) & (predicted == 1)].sum() - offer_cost * tp],
+    ]
+    labels = [["True negative", "False positive"], ["False negative", "True positive"]]
+    cell_text = [
+        [f"{labels[row][col]}<br>{matrix[row, col]:,} ({matrix[row, col] / len(y_true):.1%})"
+         f"<br>{'-' if dollars[row][col] < 0 else '+'}${abs(dollars[row][col]):,.0f}"
+         for col in range(2)]
+        for row in range(2)
+    ]
+    left, right = st.columns(2)
+    with left:
+        fig = go.Figure(go.Heatmap(
+            z=matrix / len(y_true), x=["Predicted stay", "Predicted churn"],
+            y=["Actual stay", "Actual churn"], text=cell_text, texttemplate="%{text}",
+            colorscale="Blues", showscale=False, hovertemplate="%{text}<extra></extra>",
+        ))
+        fig.update_layout(title=f"Confusion matrix · threshold {threshold:.2f}", height=390)
+        show_plot(fig, "current_test_confusion")
+    with right:
+        threshold_grid = np.linspace(0.02, 0.95, 94)
+        values = [net_campaign_value(y_true, probabilities, monthly_charges, value) for value in threshold_grid]
+        fig = go.Figure(go.Scatter(x=threshold_grid, y=values, mode="lines",
+                                   line=dict(color="#246b62", width=3), name="Held-out test"))
+        fig.add_vline(x=threshold, line_dash="dot", line_color="#bd5a37",
+                      annotation_text=f"Current {threshold:.2f}")
+        fig.add_hline(y=0, line_color="#777777", line_width=1)
+        fig.update_layout(title="Retention campaign value by threshold", xaxis_title="Decision threshold",
+                          yaxis_title="Net value vs. doing nothing ($)", height=390)
+        show_plot(fig, "current_test_profit")
+
+    order = np.argsort(-probabilities, kind="stable")
+    sorted_y = y_true[order]
+    decile_rows = []
+    cumulative = 0
+    churners = max(int(y_true.sum()), 1)
+    for decile, group in enumerate(np.array_split(sorted_y, 10), start=1):
+        count = int(group.sum())
+        cumulative += count
+        rate = float(group.mean()) if len(group) else 0.0
+        decile_rows.append({"Decile": decile, "Customers": len(group), "Churn rate": rate,
+                            "Lift": rate / prevalence if prevalence else 0.0,
+                            "Cumulative churn captured": cumulative / churners})
+    deciles = pd.DataFrame(decile_rows)
+    left, right = st.columns(2)
+    with left:
+        fig = px.bar(deciles, x="Decile", y="Churn rate", hover_data=["Lift", "Customers"],
+                     color="Churn rate", color_continuous_scale=["#c8ddd5", "#246b62"])
+        fig.add_hline(y=prevalence, line_dash="dot", line_color="#bd5a37",
+                      annotation_text=f"Baseline {prevalence:.1%}")
+        fig.update_layout(title="Churn rate by risk decile · 1 is highest", height=380,
+                          coloraxis_showscale=False)
+        fig.update_yaxes(tickformat=".0%")
+        show_plot(fig, "current_test_deciles")
+    with right:
+        population = np.linspace(0, 1, 11)
+        capture = [0.0] + deciles["Cumulative churn captured"].tolist()
+        fig = go.Figure()
+        fig.add_scatter(x=population, y=capture, mode="lines+markers", name="Current model",
+                        line=dict(color="#246b62", width=3))
+        fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random targeting",
+                        line=dict(color="#777777", dash="dash"))
+        fig.update_layout(title="Cumulative churn capture", xaxis_title="Share of customers contacted",
+                          yaxis_title="Share of churners captured", height=380)
+        show_plot(fig, "current_test_gains")
+
+    observed, predicted_probability = calibration_curve(y_true, probabilities, n_bins=15, strategy="quantile")
+    fig = go.Figure()
+    fig.add_scatter(x=predicted_probability, y=observed, mode="lines+markers", name="Current model",
+                    line=dict(color="#246b62", width=3))
+    fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", name="Perfect calibration",
+                    line=dict(color="#777777", dash="dash"))
+    fig.update_layout(title="Probability calibration", xaxis_title="Mean predicted probability",
+                      yaxis_title="Observed churn rate", height=380)
+    show_plot(fig, "current_test_calibration")
+
+    predictions = pd.DataFrame({
+        "CustomerID": data["customer_id"],
+        "ChurnProbability": probabilities,
+        "PredictedChurn": predicted,
+        "RiskLevel": np.where(probabilities >= threshold, "High",
+                               np.where(probabilities >= 0.8 * threshold, "Medium", "Low")),
+        "ActualChurn": y_true,
+    }).sort_values("ChurnProbability", ascending=False)
+    st.markdown("**Highest-risk test customers**")
+    stretch(st.dataframe, predictions.head(50).style.format({"ChurnProbability": "{:.1%}"}), hide_index=True)
+    st.download_button("Download all test predictions", predictions.to_csv(index=False),
+                        "current_test_predictions.csv", "text/csv", key="download_current_test_predictions")
+
+
 # ----------------------------------------------------------------------------- API check
 try:
     api_get("/health")
@@ -80,14 +289,14 @@ except Exception as e:
     st.stop()
 
 # ----------------------------------------------------------------------------- sidebar
+default_threshold = min(0.95, max(0.05, float(schema.get("default_threshold", 0.50))))
 with st.sidebar:
     st.header("Settings")
     threshold = st.slider(
-        "Decision threshold",
-        0.05, 0.95, 0.50, 0.01,
+        "Decision threshold", 0.05, 0.95, default_threshold, 0.01,
         help="A customer is flagged as a churner when their probability is at or above this value. "
              "Lower = catch more churners (higher recall) but more false alarms. "
-             "The scores in the notebook use 0.50.",
+             "The initial value is the notebook's profit-selected threshold when available.",
     )
     st.caption("🟢 API connected")
     st.caption(f"`{API_URL}`")
@@ -363,48 +572,65 @@ with tab_batch:
 
 # ----------------------------------------------------------------------------- TAB 3: performance
 with tab_perf:
-    st.subheader("Held-out test performance (from the training notebook)")
-    test, train = metrics["test"], metrics["train"]
-    rep = metrics["classification_report"]
+    st.subheader("Live evaluation of the served model")
+    st.caption("Scores the held-out test customers through the running API; cached for one hour.")
+    if not TEST_FEATURES_PATH.exists() or not TEST_LABELS_PATH.exists():
+        st.warning("The local data/test.csv and data/test_sol.csv files are needed for held-out evaluation.")
+    elif st.button("Score held-out test set", type="primary", key="score_current_test"):
+        try:
+            with st.spinner("Scoring the held-out customers and preparing evaluation charts..."):
+                st.session_state["current_test_results"] = get_current_test_predictions(
+                    API_URL,
+                    str(TEST_FEATURES_PATH),
+                    str(TEST_LABELS_PATH),
+                    TEST_FEATURES_PATH.stat().st_mtime,
+                    TEST_LABELS_PATH.stat().st_mtime,
+                )
+        except Exception as e:
+            st.error(f"Could not evaluate the current model: {api_error(e)}")
 
-    k = st.columns(4)
-    k[0].metric("Test ROC-AUC", f"{test['roc_auc']:.4f}", f"{test['roc_auc'] - train['roc_auc']:+.4f} vs train", delta_color="off")
-    k[1].metric("Test accuracy", f"{test['accuracy']:.4f}", f"{test['accuracy'] - train['accuracy']:+.4f} vs train", delta_color="off")
-    k[2].metric("Churn recall", f"{rep['Churned (1)']['recall']:.2f}")
-    k[3].metric("Churn precision", f"{rep['Churned (1)']['precision']:.2f}")
+    current_test_results = st.session_state.get("current_test_results")
+    if current_test_results:
+        render_current_test_results(current_test_results, threshold)
+    else:
+        st.info("Run the held-out evaluation to see current metrics, notebook-aligned graphs, and customer predictions.")
 
-    left, right = st.columns([1, 1.3])
-    with left:
-        st.markdown("**Train vs test**")
-        st.dataframe(pd.DataFrame(
-            {"Train": [train["roc_auc"], train["accuracy"]], "Test": [test["roc_auc"], test["accuracy"]]},
-            index=["ROC-AUC", "Accuracy"]).style.format("{:.4f}"))
-        ds = metrics["dataset"]
-        st.caption(f"Train: {ds['train_shape'][0]:,} rows · Test: {ds['test_shape'][0]:,} rows · "
-                   f"{ds['train_shape'][1]} columns")
-    with right:
-        st.markdown("**Classification report (threshold 0.50)**")
-        st.dataframe(pd.DataFrame(rep).T.rename(columns={"f1": "f1-score"}).style.format(
-            {"precision": "{:.2f}", "recall": "{:.2f}", "f1-score": "{:.2f}", "support": "{:,.0f}"}))
-
-    churn_share = rep["Churned (1)"]["support"] / rep["Weighted avg"]["support"]
-    st.info(
-        f"Only about **{churn_share:.0%}** of test customers churn, so at 68% recall the model also flags many "
-        f"loyal customers — that is why churn precision is {rep['Churned (1)']['precision']:.2f}. "
-        "Use the sidebar threshold to trade recall for precision."
-    )
-
-    st.markdown("### Evaluation graphs")
-    a, b = st.columns(2)
-    with a:
-        show_image("roc_curve.png", "ROC curve")
-    with b:
-        show_image("pr_curve.png", "Precision-recall curve")
-    a, b = st.columns(2)
-    with a:
-        show_image("confusion_matrix.png", "Confusion matrix (test set)")
-    with b:
-        show_image("cumulative_gains.png", "Cumulative gains curve")
+    with st.expander("Saved training snapshot and notebook graphs"):
+        st.caption("Metric tables come from the API's /metrics endpoint; graphs are static exports from the notebook. "
+                   "Live results above use the model currently served.")
+        test, train = metrics["test"], metrics["train"]
+        rep = metrics["classification_report"]
+        k = st.columns(4)
+        k[0].metric("Saved test ROC-AUC", f"{test['roc_auc']:.4f}")
+        k[1].metric("Saved test accuracy", f"{test['accuracy']:.4f}")
+        k[2].metric("Saved churn recall", f"{rep['Churned (1)']['recall']:.2f}")
+        k[3].metric("Saved churn precision", f"{rep['Churned (1)']['precision']:.2f}")
+        left, right = st.columns([1, 1.3])
+        with left:
+            st.markdown("**Saved train vs test**")
+            st.dataframe(pd.DataFrame(
+                {"Train": [train["roc_auc"], train["accuracy"]], "Test": [test["roc_auc"], test["accuracy"]]},
+                index=["ROC-AUC", "Accuracy"]).style.format("{:.4f}"))
+            ds = metrics["dataset"]
+            st.caption(f"Train: {ds['train_shape'][0]:,} rows · Test: {ds['test_shape'][0]:,} rows · "
+                       f"{ds['train_shape'][1]} columns")
+        with right:
+            st.markdown("**Saved classification report (threshold 0.50)**")
+            st.dataframe(pd.DataFrame(rep).T.rename(columns={"f1": "f1-score"}).style.format(
+                {"precision": "{:.2f}", "recall": "{:.2f}", "f1-score": "{:.2f}", "support": "{:,.0f}"}))
+        st.markdown("**Notebook evaluation graphs**")
+        show_image("roc_pr_vs_baselines.png", "ROC and precision-recall: XGBoost vs. logistic regression and no-skill baselines")
+        a, b = st.columns(2)
+        with a:
+            show_image("profit_vs_threshold.png", "Retention campaign value by threshold (out-of-fold vs. held-out test)")
+        with b:
+            show_image("confusion_matrix_profit.png", "Confusion matrix with % of customers and $ impact")
+        show_image("decile_lift_gains.png", "Decile lift and cumulative gains on the held-out test set")
+        a, b = st.columns(2)
+        with a:
+            show_image("calibration.png", "Probability calibration curve")
+        with b:
+            show_image("learning_curve.png", "Learning curve with early stopping")
 
 
 # ----------------------------------------------------------------------------- TAB 4: insights
@@ -428,15 +654,30 @@ with tab_insights:
         st.error(f"Could not load feature importance: {api_error(e)}")
 
     st.markdown("### Notebook graphs")
+    st.caption("Static figures exported from the final run of Churn_Prediction.ipynb.")
+
+    st.markdown("#### Explainability")
     a, b = st.columns(2)
     with a:
-        show_image("feature_importance.png", "Top 10 feature importances (notebook)")
+        show_image("importance_gain_vs_shap.png", "XGBoost built-in importance (gain) vs. mean |SHAP value|")
     with b:
-        show_image("correlation_heatmap.png", "Correlation between numeric features")
-    show_image("churn_by_subscription.png", "Churn by subscription type")
-    show_image("churn_by_categorical.png", "Churn across categorical features")
-    with st.expander("Last decision tree of the model (large)"):
-        show_image("last_tree.png", "Tree #1499 — one of 1,500 trees in the ensemble")
+        show_image("shap_beeswarm.png", "SHAP summary: direction and size of each driver's effect")
+    a, b = st.columns(2)
+    with a:
+        show_image("shap_waterfall.png", "Why the highest-risk customer in the SHAP sample was flagged")
+    with b:
+        show_image("shap_dependence.png", "SHAP dependence plot for the strongest driver")
+
+    st.markdown("#### Exploratory data analysis")
+    a, b = st.columns(2)
+    with a:
+        show_image("target_balance.png", "Target balance in the train and test sets")
+    with b:
+        show_image("correlation_heatmap.png", "Correlation between numeric features and churn (train)")
+    with st.expander("Numeric feature distributions by churn class"):
+        show_image("numeric_distributions.png", "Numeric feature distributions, churned vs. retained (train sample)")
+    with st.expander("Churn rate by category"):
+        show_image("churn_by_categorical.png", "Churn rate for each category of every categorical feature")
 
 
 # ----------------------------------------------------------------------------- TAB 5: about

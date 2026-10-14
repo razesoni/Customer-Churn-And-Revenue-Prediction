@@ -11,8 +11,10 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 BACKEND_DIR = Path(__file__).resolve().parent
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+ROOT = BACKEND_DIR.parent
+for import_path in (ROOT, BACKEND_DIR):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 try:
     from .evaluation import evaluate
@@ -23,7 +25,6 @@ except ImportError:  # pragma: no cover
     from features import ENGINEERED_COLUMNS
     from model_service import ModelService
 
-ROOT = BACKEND_DIR.parent
 MODEL_PATH = Path(os.getenv("CHURN_MODEL_PATH", str(ROOT / "model.joblib")))
 if not MODEL_PATH.exists():
     alt = ROOT / "data" / "model.joblib"
@@ -34,6 +35,15 @@ if not METRICS_PATH.exists():
     alt = ROOT / "data" / "metrics.json"
     if alt.exists():
         METRICS_PATH = alt
+MODEL_CARD_PATH = ROOT / "model_card.json"
+DEFAULT_THRESHOLD = 0.5
+if MODEL_CARD_PATH.exists():
+    try:
+        card_threshold = float(json.loads(MODEL_CARD_PATH.read_text()).get("threshold", 0.5))
+        if 0.01 <= card_threshold <= 0.99:
+            DEFAULT_THRESHOLD = card_threshold
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
 MAX_BATCH_ROWS = 100_000
 
 service: ModelService | None = None
@@ -90,6 +100,7 @@ def schema():
         "raw_columns": service.raw_columns,
         "categories": service.categories,
         "engineered": ENGINEERED_COLUMNS,
+        "default_threshold": DEFAULT_THRESHOLD,
     }
 
 
@@ -108,7 +119,7 @@ def feature_importance(
 
 
 @app.post("/predict")
-def predict(customer: CustomerInput, threshold: float = Query(0.5, ge=0.01, le=0.99)):
+def predict(customer: CustomerInput, threshold: float = Query(DEFAULT_THRESHOLD, ge=0.01, le=0.99)):
     raw = pd.DataFrame([customer.model_dump()])
     unseen = service.unseen_categories(raw)
     if unseen:
@@ -129,7 +140,7 @@ def predict(customer: CustomerInput, threshold: float = Query(0.5, ge=0.01, le=0
 
 
 @app.post("/predict/batch")
-async def predict_batch(file: UploadFile = File(...), threshold: float = Query(0.5, ge=0.01, le=0.99)):
+async def predict_batch(file: UploadFile = File(...), threshold: float = Query(DEFAULT_THRESHOLD, ge=0.01, le=0.99)):
     """Score a CSV. If it also has a 0/1 `Churn` column, live evaluation graphs/scores are returned too."""
     try:
         df = pd.read_csv(io.BytesIO(await file.read()))
