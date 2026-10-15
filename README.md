@@ -1,4 +1,4 @@
-# Customer Churn Prediction
+# Customer Churn & Revenue Prediction
 
 A machine learning project designed to predict customer churn for a video streaming platform and estimate the financial impact of a retention campaign. The repository includes a reproducible notebook, a Python API, and a Streamlit dashboard for scoring single customers and batches of customers in real time.
 
@@ -23,6 +23,9 @@ The goal is to answer the following question:
 - What is the expected value of a churn-prevention campaign?
 
 The model is designed to balance recall and precision so that retention teams can act on the highest-risk accounts while managing cost and campaign efficiency.
+
+## Dataset
+Coursera Data Science Challenge
 
 ## Key findings
 
