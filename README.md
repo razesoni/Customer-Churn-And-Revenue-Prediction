@@ -29,6 +29,16 @@ cd backend && uvicorn main:app --port 8000     # API docs at http://localhost:80
 streamlit run frontend/app.py                  # dashboard at http://localhost:8501
 ```
 
+## Run with Docker
+
+Build and start both services from the project root:
+
+```bash
+docker compose up --build
+```
+
+Open the dashboard at http://localhost:8501 or the API docs at http://localhost:8000/docs. The dashboard connects to the API through the Compose service network. Stop the services with `docker compose down`.
+
 To point the dashboard at a remote API: `CHURN_API_URL=https://your-api streamlit run frontend/app.py`
 
 ## Dashboard tabs

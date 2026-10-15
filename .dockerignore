@@ -1,0 +1,10 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+Churn_Prediction.ipynb
+data/*.csv
+!data/test.csv
+!data/test_sol.csv
+data/model.joblib
